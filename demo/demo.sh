@@ -5,12 +5,15 @@
 #   B. 回滚不记录
 #   C. 采集停顿期间源库照常提交，恢复后续采
 #   D. 落库后、确认前崩溃 -> 重启自动续采，不漏不重
+#   E. 日志翻页与样本检索
+#   F. 补传批次：左开右闭区间净变化、改名双键、断裂检测、幂等与重启不变
 # 用法：./demo/demo.sh
 # ============================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-# 读取 .env
+# 读取 .env（不存在则从模板复制一份）
+[ -f .env ] || cp .env.example .env
 set -a; . ./.env; set +a
 
 FAIL=0
@@ -29,6 +32,10 @@ src_sql()  { "${PSQL_SRC[@]}" "$@"; }
 log_sql()  { "${PSQL_LOG[@]}" "$@"; }
 api_get()  { "${API[@]}" "http://localhost:8000$1"; }
 api_json() { api_get "$1" | python3 -m json.tool; }
+api_post() { # api_post PATH JSON_BODY -> 输出 "响应体\nHTTP状态码"
+  docker compose exec -T api curl -sS -X POST "http://localhost:8000$1" \
+    -H 'Content-Type: application/json' -d "$2" -w '\n%{http_code}'
+}
 
 section "0. 启动环境（构建镜像 + 初始化两个库 + 启动采集器）"
 docker compose up -d --build
@@ -186,6 +193,165 @@ info "用 next_cursor 翻下一页: cursor=$CURSOR"
 api_json "/commits?limit=1&cursor=$CURSOR"
 info "按样本号检索（S2026-0002，看到两次更正的前后值）"
 api_json "/changes?sample_no=S2026-0002"
+
+# ------------------------------------------------------------ F 补传批次
+section "F. 补传批次：左开右闭区间净变化、改名双键、断裂检测与幂等"
+FROM_LSN=$(log_sql -c "SELECT persisted_lsn::text FROM slot_state WHERE slot_name='$SLOT_NAME';")
+info "窗口左开起点 FROM_LSN=$FROM_LSN（不含该位置的提交）"
+src_sql < demo/sql/05_backfill_window.sql
+
+info "等待 5 笔窗口事务全部入库..."
+for i in $(seq 1 30); do
+  N=$(log_sql -c "SELECT count(*) FROM source_commit
+                   WHERE slot_name='$SLOT_NAME' AND commit_lsn > '$FROM_LSN'::pg_lsn;")
+  [ "$N" = "5" ] && break
+  sleep 1
+done
+check "窗口内事务数" "5" "$N"
+TO_LSN=$(log_sql -c "SELECT max(commit_lsn)::text FROM source_commit WHERE slot_name='$SLOT_NAME';")
+TXN1_LSN=$(log_sql -c "SELECT commit_lsn::text FROM source_commit
+                        WHERE slot_name='$SLOT_NAME' AND commit_lsn > '$FROM_LSN'::pg_lsn
+                        ORDER BY commit_lsn LIMIT 1;")
+info "补传区间 ($FROM_LSN, $TO_LSN]，窗口首笔事务 $TXN1_LSN"
+BODY="{\"from_lsn\":\"$FROM_LSN\",\"to_lsn\":\"$TO_LSN\"}"
+
+info "F1. 终点必须是已完整入库的事务"
+RESP=$(api_post /backfill-batches "{\"from_lsn\":\"$FROM_LSN\",\"to_lsn\":\"FF/FFFFFFFF\"}")
+CODE=$(printf '%s\n' "$RESP" | tail -n 1)
+check "未完整入库的终点被拒绝（400）" "400" "$CODE"
+
+info "F2. 变更链断裂：整批不发布并指出断裂的提交位置"
+log_sql -c "UPDATE result_change
+               SET new_values = jsonb_set(new_values, '{result}', to_jsonb('6.6'::text), false)
+             WHERE slot_name='$SLOT_NAME' AND commit_lsn='$TXN1_LSN' AND change_seq=1;"
+RESP=$(api_post /backfill-batches "$BODY")
+CODE=$(printf '%s\n' "$RESP" | tail -n 1)
+check "断裂区间创建批次被拒绝（409）" "409" "$CODE"
+BROKEN_LSN=$(printf '%s\n' "$RESP" | sed '$d' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['detail']['broken_commit_lsn'])")
+check "指出断裂的提交位置" "$TXN1_LSN" "$BROKEN_LSN"
+REASON=$(printf '%s\n' "$RESP" | sed '$d' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['detail']['reason'])")
+check "断裂原因" "adjacent_mismatch" "$REASON"
+NB=$(api_get /backfill-batches | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+check "整批不发布（批次列表为空）" "0" "$NB"
+log_sql -c "UPDATE result_change
+               SET new_values = jsonb_set(new_values, '{result}', to_jsonb('6.0'::text), false)
+             WHERE slot_name='$SLOT_NAME' AND commit_lsn='$TXN1_LSN' AND change_seq=1;"
+info "已恢复被篡改的日志行"
+
+info "F3. 同区间并发创建只产生一份"
+for i in 1 2 3; do api_post /backfill-batches "$BODY" > "/tmp/bf_$i.json" & done
+wait
+BID1=$(sed '$d' /tmp/bf_1.json | python3 -c "import sys,json; print(json.load(sys.stdin)['batch_id'])")
+BID2=$(sed '$d' /tmp/bf_2.json | python3 -c "import sys,json; print(json.load(sys.stdin)['batch_id'])")
+BID3=$(sed '$d' /tmp/bf_3.json | python3 -c "import sys,json; print(json.load(sys.stdin)['batch_id'])")
+check "并发创建得到同一批次号" "yes" \
+  "$([ "$BID1" = "$BID2" ] && [ "$BID2" = "$BID3" ] && echo yes || echo no)"
+NB=$(api_get /backfill-batches | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+check "批次列表只有一份" "1" "$NB"
+BID=$BID1
+
+info "F4. 净变化内容（首旧末新、改名双键、插入后删除与前后相同剔除）"
+api_get "/backfill-batches/$BID" > /tmp/batch.json
+api_json "/backfill-batches/$BID"
+if python3 - <<'EOF'
+import json
+b = json.load(open("/tmp/batch.json"))
+errors = []
+def expect(cond, msg):
+    if not cond:
+        errors.append(msg)
+
+expect(b["row_count"] == 5, f"row_count 应为 5，实际 {b['row_count']}")
+expect(b["commit_count"] == 5, f"commit_count 应为 5，实际 {b['commit_count']}")
+expect(b["change_count"] == 10, f"change_count 应为 10，实际 {b['change_count']}")
+rows = b["rows"]
+expect([r["row_id"] for r in rows] == sorted(r["row_id"] for r in rows),
+       "批次行应按 results.id 升序")
+
+def find(pred):
+    hit = [r for r in rows if pred(r)]
+    return hit[0] if hit else None
+
+# 1) 同一行反复更正 -> 首旧 5.6 / 末新 6.1
+r = find(lambda r: (r["new_test_item"] or r["old_test_item"]) == "血糖")
+expect(r is not None and r["action"] == "U", "血糖应为 U 净变化")
+if r:
+    old_res = (r["old_values"] or {}).get("result")
+    new_res = (r["new_values"] or {}).get("result")
+    expect(old_res == "5.6", f"血糖净旧值应为 5.6，实际 {old_res}")
+    expect(new_res == "6.1", f"血糖净新值应为 6.1，实际 {new_res}")
+    expect(r["source_changes"] == 2, f"血糖应有 2 条源变更，实际 {r['source_changes']}")
+    expect(r["key_renamed"] is False, "血糖未改名")
+
+# 2) 样本号改名：保留旧、新键
+r = find(lambda r: r["new_sample_no"] == "S2026-0002R")
+expect(r is not None and r["key_renamed"] is True, "样本号改名应置 key_renamed")
+if r:
+    expect(r["old_sample_no"] == "S2026-0002", "应保留旧样本号 S2026-0002")
+    expect(r["new_sample_no"] == "S2026-0002R", "应保留新样本号 S2026-0002R")
+    expect(r["old_test_item"] == "糖化血红蛋白", "应保留旧检测项目")
+
+# 3) 检测项目改名：保留旧、新键
+r = find(lambda r: r["new_test_item"] == "血钾（急查）")
+expect(r is not None and r["key_renamed"] is True, "检测项目改名应置 key_renamed")
+if r:
+    expect(r["old_test_item"] == "血钾", "应保留旧检测项目 血钾")
+
+# 4) 普通插入：插入前为空
+r = find(lambda r: r["new_sample_no"] == "S2026-0009")
+expect(r is not None and r["action"] == "I", "S2026-0009 应为 I 净变化")
+if r:
+    expect(r["old_values"] is None and r["old_sample_no"] is None, "插入前应为空")
+
+# 5) 普通删除：删除后为空
+r = find(lambda r: r["old_test_item"] == "血常规-红细胞")
+expect(r is not None and r["action"] == "D", "血常规-红细胞应为 D 净变化")
+if r:
+    expect(r["new_values"] is None and r["new_sample_no"] is None, "删除后应为空")
+    expect((r["old_values"] or {}).get("sample_no") == "S2026-0001", "删除应保留完整旧值")
+
+# 6) 插入后删除、改回原值的行不进入批次
+expect(not any((r["new_sample_no"] == "S2026-0008") or (r["old_sample_no"] == "S2026-0008")
+               for r in rows), "插入后删除的 S2026-0008 不应进入批次")
+expect(not any((r["new_test_item"] == "谷丙转氨酶") or (r["old_test_item"] == "谷丙转氨酶")
+               for r in rows), "前后相同的谷丙转氨酶不应进入批次")
+
+if errors:
+    print("\n".join("  [FAIL] " + e for e in errors))
+    raise SystemExit(1)
+print("  批次内容全部符合预期")
+EOF
+then
+  echo "  [PASS] 批次净变化内容（5 行：反复更正 1 + 改名 2 + 插入 1 + 删除 1）"
+else
+  echo "  [FAIL] 批次净变化内容"; FAIL=$((FAIL+1))
+fi
+
+info "F5. 客户端重试、采集继续、服务重启后读取内容不变"
+api_get "/backfill-batches/$BID" > /tmp/batch_snap1.json
+RESP=$(api_post /backfill-batches "$BODY")
+CODE=$(printf '%s\n' "$RESP" | tail -n 1)
+BID_RETRY=$(printf '%s\n' "$RESP" | sed '$d' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['batch_id'])")
+check "客户端重试返回 200" "200" "$CODE"
+check "重试得到同一批次号" "$BID" "$BID_RETRY"
+info "采集继续：源库再提交一笔（落在已发布区间之外）"
+src_sql -c "UPDATE results SET result='81' WHERE sample_no='S2026-0003' AND test_item='肌酐';"
+sleep 3
+info "重启 API 服务..."
+docker compose restart api >/dev/null
+for i in $(seq 1 30); do
+  if docker compose exec -T api curl -fsS http://localhost:8000/health >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+api_get "/backfill-batches/$BID" > /tmp/batch_snap2.json
+SAME=$(python3 -c "import json; a=json.load(open('/tmp/batch_snap1.json')); \
+b=json.load(open('/tmp/batch_snap2.json')); print('yes' if a==b else 'no')")
+check "采集继续+服务重启后批次内容不变" "yes" "$SAME"
+NB=$(api_get /backfill-batches | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+check "批次总数仍为 1" "1" "$NB"
 
 section "结果"
 if [ "$FAIL" -eq 0 ]; then

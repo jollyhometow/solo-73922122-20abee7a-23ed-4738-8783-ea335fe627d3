@@ -3,19 +3,40 @@
 
 只查询独立日志库中已完整提交的事务；采集器按事务原子写入，
 因此本接口永远不会读到“半笔事务”。
+
+补传批次：把左开右闭区间 (from_lsn, to_lsn] 内反复更正的 results 变更
+合成为稳定的入仓净变化并整体持久化；同区间只产生一份，创建后读取内容不变。
 """
 from __future__ import annotations
 
+import logging
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from psycopg2.errors import InvalidTextRepresentation, UndefinedObject
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from . import backfill
+from .backfill_core import BrokenChain
 from .config import get_settings
 from .db import log_query, source_query
-from .lsn import lsn_valid
+from .lsn import lsn_to_int, lsn_valid
+
+logger = logging.getLogger("api")
+settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 已有数据卷的环境升级时幂等补齐补传批次表（全新环境由 log-db/initdb 建好）
+    try:
+        backfill.ensure_schema(settings)
+    except Exception:
+        logger.exception("ensure backfill schema failed (will rely on initdb scripts)")
+    yield
+
 
 app = FastAPI(
     title="检验结果变更日志 API",
@@ -24,11 +45,13 @@ app = FastAPI(
         "- 仅含建槽之后的 INSERT/UPDATE/DELETE；\n"
         "- 更正、删除保留完整旧值，同事务同行多次修改逐条保序；\n"
         "- 按源提交位置（commit_lsn）翻页，顺序与源提交一致；\n"
-        "- 回滚事务不会出现。"
+        "- 回滚事务不会出现；\n"
+        "- 补传批次：指定左开右闭的源提交位置区间，把窗口内反复更正的记录\n"
+        "  合成为稳定的入仓净变化（首条旧值 + 末条新值），持久化后内容不变。"
     ),
-    version="1.0.0",
+    version="1.1.0",
+    lifespan=lifespan,
 )
-settings = get_settings()
 
 
 # ----------------------------------------------------------------- 响应模型
@@ -305,3 +328,116 @@ def get_status():
         source_pg_current_lsn=current_lsn,
         retained_wal_bytes=retained,
     )
+
+
+# ================================================================= 补传批次
+class BackfillBatchCreate(BaseModel):
+    from_lsn: str = Field(
+        "0/0",
+        description="左开起点（不含该位置的提交）。缺省 0/0 表示从日志开头开始",
+        examples=["0/1A2B3C8"],
+    )
+    to_lsn: str = Field(
+        ...,
+        description="右闭终点（含），必须是已完整入库的事务提交位置",
+        examples=["0/1A2C900"],
+    )
+
+
+class BackfillRow(BaseModel):
+    row_seq: int
+    row_id: int
+    action: str
+    old_sample_no: str | None
+    old_test_item: str | None
+    new_sample_no: str | None
+    new_test_item: str | None
+    key_renamed: bool
+    old_values: dict[str, Any] | None
+    new_values: dict[str, Any] | None
+    first_commit_lsn: str
+    last_commit_lsn: str
+    source_changes: int
+
+
+class BackfillBatch(BaseModel):
+    batch_id: int
+    slot_name: str
+    from_lsn: str
+    to_lsn: str
+    commit_count: int
+    change_count: int
+    row_count: int
+    created_at: datetime
+    rows: list[BackfillRow]
+
+
+class BackfillBatchSummary(BaseModel):
+    batch_id: int
+    slot_name: str
+    from_lsn: str
+    to_lsn: str
+    commit_count: int
+    change_count: int
+    row_count: int
+    created_at: datetime
+
+
+@app.post(
+    "/backfill-batches",
+    response_model=BackfillBatch,
+    status_code=201,
+    summary="创建补传批次：左开右闭区间内反复更正的记录合成为稳定净变化",
+    responses={
+        200: {"description": "同区间批次已存在（并发创建或客户端重试），返回已持久化的那一份"},
+        400: {"description": "区间端点不合法（终点不是已完整入库的事务等）"},
+        409: {"description": "窗口内变更链断裂，整批不发布；detail 指出断裂的提交位置"},
+    },
+)
+def create_backfill_batch(req: BackfillBatchCreate, response: Response):
+    """把 (from_lsn, to_lsn] 内的 results 变更整理成稳定的入仓批次：
+
+    - 按 results.id 分组、源变更顺序排序，取窗口内首条旧值与末条新值合成净变化，
+      插入前、删除后视为空；前后相同、插入后删除的行不进入批次；
+    - 样本号/检测项目改名时保留旧、新键（old_*/new_*），供下游撤销旧记录并写入新记录；
+    - 区间与结果一起持久化，同区间并发创建只产生一份；创建后即使采集继续、
+      客户端重试或服务重启，读取内容仍相同。
+    """
+    if not lsn_valid(req.from_lsn) or not lsn_valid(req.to_lsn):
+        raise HTTPException(status_code=400, detail="invalid LSN format")
+    if lsn_to_int(req.from_lsn) >= lsn_to_int(req.to_lsn):
+        raise HTTPException(
+            status_code=400,
+            detail=f"左开起点必须小于右闭终点：from_lsn={req.from_lsn}, to_lsn={req.to_lsn}",
+        )
+    try:
+        batch, created = backfill.create_batch(settings, req.from_lsn, req.to_lsn)
+    except backfill.IntervalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except BrokenChain as exc:
+        # 整批不发布：指出断裂的提交位置与原因
+        raise HTTPException(status_code=409, detail=exc.detail())
+    if not created:
+        response.status_code = 200
+    return batch
+
+
+@app.get(
+    "/backfill-batches",
+    response_model=list[BackfillBatchSummary],
+    summary="补传批次列表（不含批次行）",
+)
+def list_backfill_batches():
+    return backfill.list_batches(settings)
+
+
+@app.get(
+    "/backfill-batches/{batch_id}",
+    response_model=BackfillBatch,
+    summary="读取补传批次（内容自创建起不变）",
+)
+def get_backfill_batch(batch_id: int):
+    batch = backfill.get_batch(settings, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="batch not found")
+    return batch
